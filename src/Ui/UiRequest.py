@@ -218,7 +218,7 @@ class UiRequest(object):
 
         if self.env["REQUEST_METHOD"] == "OPTIONS":
             # Allow json access
-            headers.append(("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Cookie"))
+            headers.append(("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Cookie, Range"))
             headers.append(("Access-Control-Allow-Credentials", "true"))
 
         if content_type == "text/html":
@@ -427,6 +427,8 @@ class UiRequest(object):
             path_parts = match.groupdict()
             path_parts["request_address"] = path_parts["address"]  # Original request address (for Merger sites)
             path_parts["inner_path"] = path_parts["inner_path"].lstrip("/")
+            if not path_parts["inner_path"]:
+                path_parts["inner_path"] = "index.html"
             return path_parts
         else:
             return None
@@ -637,10 +639,12 @@ class UiRequest(object):
         sites = self.server.sites
         main = sys.modules["main"]
 
-        def bench(code, times=100):
+        def bench(code, times=100, init=None):
             sites = self.server.sites
             main = sys.modules["main"]
             s = time.time()
+            if init:
+                eval(compile(init, '<string>', 'exec'), globals(), locals())
             for _ in range(times):
                 back = eval(code, globals(), locals())
             return ["%s run: %.3fs" % (times, time.time() - s), back]

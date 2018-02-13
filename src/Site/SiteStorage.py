@@ -8,6 +8,8 @@ import sys
 import sqlite3
 import gevent.event
 
+import util
+from util import SafeRe
 from Db import Db
 from Debug import Debug
 from Config import config
@@ -41,31 +43,24 @@ class SiteStorage(object):
         else:
             return False
 
-    # Load db from dbschema.json
-    def openDb(self, check=True):
-        try:
-            schema = self.loadJson("dbschema.json")
-            db_path = self.getPath(schema["db_file"])
-        except Exception, err:
-            raise Exception("dbschema.json is not a valid JSON: %s" % err)
-
-        if check:
-            if not os.path.isfile(db_path) or os.path.getsize(db_path) == 0:  # Not exist or null
-                self.rebuildDb()
-
-        if not self.db:
-            self.db = Db(schema, db_path)
-
-        if check and not self.db_checked:
-            changed_tables = self.db.checkTables()
-            if changed_tables:
-                self.rebuildDb(delete_db=False)  # TODO: only update the changed table datas
+    # Create new databaseobject  with the site's schema
+    def openDb(self):
+        schema = self.getDbSchema()
+        db_path = self.getPath(schema["db_file"])
+        return Db(schema, db_path)
 
     def closeDb(self):
         if self.db:
             self.db.close()
         self.event_db_busy = None
         self.db = None
+
+    def getDbSchema(self):
+        try:
+            schema = self.loadJson("dbschema.json")
+        except Exception, err:
+            raise Exception("dbschema.json is not a valid JSON: %s" % err)
+        return schema
 
     # Return db class
     def getDb(self):
@@ -74,7 +69,19 @@ class SiteStorage(object):
             self.site.needFile("dbschema.json", priority=3)
             self.has_db = self.isFile("dbschema.json")  # Recheck if dbschema exist
             if self.has_db:
-                self.openDb()
+                schema = self.getDbSchema()
+                db_path = self.getPath(schema["db_file"])
+                if not os.path.isfile(db_path) or os.path.getsize(db_path) == 0:
+                    self.rebuildDb()
+
+                if self.db:
+                    self.db.close()
+                self.db = self.openDb()
+
+                changed_tables = self.db.checkTables()
+                if changed_tables:
+                    self.rebuildDb(delete_db=False)  # TODO: only update the changed table datas
+
         return self.db
 
     def updateDbFile(self, inner_path, file=None, cur=None):
@@ -83,6 +90,7 @@ class SiteStorage(object):
 
     # Return possible db files for the site
     def getDbFiles(self):
+        found = 0
         for content_inner_path, content in self.site.content_manager.contents.iteritems():
             # content.json file itself
             if self.isFile(content_inner_path):
@@ -100,6 +108,9 @@ class SiteStorage(object):
                     yield file_inner_path, self.getPath(file_inner_path)
                 else:
                     self.log.error("[MISSING] %s" % file_inner_path)
+                found += 1
+                if found % 100 == 0:
+                    time.sleep(0.000001)  # Context switch to avoid UI block
 
     # Rebuild sql cache
     def rebuildDb(self, delete_db=True):
@@ -118,17 +129,18 @@ class SiteStorage(object):
                 os.unlink(db_path)
             except Exception, err:
                 self.log.error("Delete error: %s" % err)
-        self.db = None
-        self.openDb(check=False)
+
+        db = self.openDb()
         self.log.info("Creating tables...")
-        self.db.checkTables()
-        self.log.info("Importing data...")
-        cur = self.db.getCursor()
+        db.checkTables()
+        cur = db.getCursor()
         cur.execute("BEGIN")
         cur.logging = False
         found = 0
         s = time.time()
+        self.log.info("Getting db files...")
         db_files = list(self.getDbFiles())
+        self.log.info("Importing data...")
         try:
             if len(db_files) > 100:
                 self.site.messageWebsocket(_["Database rebuilding...<br>Imported {0} of {1} files..."].format("0000", len(db_files)), "rebuild", 0)
@@ -144,9 +156,13 @@ class SiteStorage(object):
                         "rebuild",
                         int(float(found) / len(db_files) * 100)
                     )
+                    time.sleep(0.000001)  # Context switch to avoid UI block
 
         finally:
             cur.execute("END")
+            cur.close()
+            db.close()
+            self.log.info("Closing Db: %s" % db)
             if len(db_files) > 100:
                 self.site.messageWebsocket(_["Database rebuilding...<br>Imported {0} of {1} files..."].format(found, len(db_files)), "rebuild", 100)
             self.log.info("Imported %s data file in %ss" % (found, time.time() - s))
@@ -226,16 +242,36 @@ class SiteStorage(object):
             raise err
 
     # List files from a directory
-    def walk(self, dir_inner_path):
+    def walk(self, dir_inner_path, ignore=None):
         directory = self.getPath(dir_inner_path)
         for root, dirs, files in os.walk(directory):
             root = root.replace("\\", "/")
             root_relative_path = re.sub("^%s" % re.escape(directory), "", root).lstrip("/")
             for file_name in files:
                 if root_relative_path:  # Not root dir
-                    yield root_relative_path + "/" + file_name
+                    file_relative_path = root_relative_path + "/" + file_name
                 else:
-                    yield file_name
+                    file_relative_path = file_name
+
+                if ignore and SafeRe.match(ignore, file_relative_path):
+                    continue
+
+                yield file_relative_path
+
+            # Don't scan directory that is in the ignore pattern
+            if ignore:
+                dirs_filtered = []
+                for dir_name in dirs:
+                    if root_relative_path:
+                        dir_relative_path = root_relative_path + "/" + dir_name
+                    else:
+                        dir_relative_path = dir_name
+
+                    if ignore == ".*" or re.match(".*([|(]|^)%s([|)]|$)" % re.escape(dir_relative_path + "/.*"), ignore):
+                        continue
+
+                    dirs_filtered.append(dir_name)
+                dirs[:] = dirs_filtered
 
     # list directories in a directory
     def list(self, dir_inner_path):
@@ -250,7 +286,7 @@ class SiteStorage(object):
             # Reopen DB to check changes
             if self.has_db:
                 self.closeDb()
-                self.openDb()
+                self.getDb()
         elif not config.disable_db and (inner_path.endswith(".json") or inner_path.endswith(".json.gz")) and self.has_db:  # Load json file to db
             if config.verbose:
                 self.log.debug("Loading json file to db: %s (file: %s)" % (inner_path, file))
@@ -471,7 +507,7 @@ class SiteStorage(object):
                         os.unlink(path)
                         break
                     except Exception, err:
-                        self.log.error("Error removing %s: %s, try #%s" % (path, err, retry))
+                        self.log.error(u"Error removing %s: %s, try #%s" % (inner_path, err, retry))
                     time.sleep(float(retry) / 10)
             self.onUpdated(inner_path, False)
 
@@ -480,10 +516,10 @@ class SiteStorage(object):
             for dir in dirs:
                 path = os.path.join(root, dir)
                 if os.path.isdir(path) and os.listdir(path) == []:
-                    os.removedirs(path)
+                    os.rmdir(path)
                     self.log.debug("Removing %s" % path)
         if os.path.isdir(self.directory) and os.listdir(self.directory) == []:
-            os.removedirs(self.directory)  # Remove sites directory if empty
+            os.rmdir(self.directory)  # Remove sites directory if empty
 
         if os.path.isdir(self.directory):
             self.log.debug("Some unknown file remained in site data dir: %s..." % self.directory)
